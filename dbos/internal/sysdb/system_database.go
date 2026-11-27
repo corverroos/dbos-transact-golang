@@ -108,6 +108,12 @@ type SystemDatabase interface {
 	SignalStreamWrite(ctx context.Context, workflowID, key string)
 	SignalEventSet(ctx context.Context, workflowID, key string)
 
+	// Optional Notifier wake-ups (see Notifier). All are no-ops, and the wake
+	// channels nil, when no Notifier is configured. Signal only after commit.
+	SignalMessagesSent(ctx context.Context, messages []WorkflowSendRow)
+	SignalQueue(queueName string)
+	QueueWakeChannel(queueName string) (<-chan struct{}, func())
+
 	// Patches
 	Patch(ctx context.Context, input PatchDBInput) (bool, error)
 	DoesPatchExists(ctx context.Context, input PatchDBInput) (string, error)
@@ -158,7 +164,15 @@ type SysDB struct {
 	streamNotifier       *notifyRegistry // stream readers, keyed by "workflowID::key"
 	notifierDone         chan struct{}   // closed when the notifier loop has made its final push
 
+	// Optional user-supplied Notifier (ext_notifier.go); all nil when unset.
+	notifier        Notifier
+	notifierMu      sync.Mutex
+	notifierPending map[string]struct{} // topics awaiting a Notify
+	queueWake       *notifyRegistry     // queue workers, keyed by queue name
+	subscriberDone  chan struct{}       // closed when the notifier subscribe loop exits
+
 	notificationCoalesceInterval time.Duration
+	notificationPollInterval     time.Duration // poller loop cadence; zero means _NOTIFICATION_POLL_INTERVAL
 
 	logger               *slog.Logger
 	encodeScheduledInput func(ctx context.Context, scheduledTime time.Time, scheduleContext json.RawMessage) (*string, string, error)
@@ -551,6 +565,7 @@ const (
 	// How often a blocked recv/getEvent waiter re-checks the database for a row
 	// whose notification it may have missed.
 	_NOTIFICATION_FALLBACK_RECHECK_INTERVAL = 60 * time.Second
+	_NOTIFICATION_POLL_INTERVAL             = 1 * time.Second // the poller loop's cadence where there is no LISTEN connection
 
 	// Database retry timeouts
 	_DB_CONNECTION_RETRY_BASE_DELAY = 1 * time.Second
@@ -1008,7 +1023,9 @@ type NewSystemDatabaseInput struct {
 	StartupTimeout               time.Duration
 	IdleTransactionTimeout       time.Duration // idle_in_transaction_session_timeout for a pool we create; zero or less leaves the server's setting
 	NotificationCoalesceInterval time.Duration
-	DisableListener              bool // hold no LISTEN connection; waiters are woken by polling
+	DisableListener              bool          // hold no LISTEN connection; waiters are woken by polling
+	Notifier                     Notifier      // optional wake-up hints next to polling; nil polls exactly as before
+	NotificationPollInterval     time.Duration // poller loop cadence without LISTEN; zero means 1s (tests shorten or lengthen it)
 	SkipMigrations               bool
 	Sharding                     ShardingBackendFactory // When set, builds a sharded system database backend.
 	// EncodeScheduledInput serializes the input of a schedule-created workflow
@@ -1066,6 +1083,18 @@ func connStringSetsPoolMaxConns(connString string) bool {
 // NewSystemDatabase creates a new SystemDatabase instance and runs migrations,
 // or verifies them under SkipMigrations.
 func NewSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (SystemDatabase, error) {
+	systemDB, err := newSystemDatabase(ctx, inputs)
+	if err != nil {
+		return nil, err
+	}
+	if s, ok := systemDB.(*SysDB); ok {
+		s.notificationPollInterval = inputs.NotificationPollInterval
+		s.attachNotifier(inputs.Notifier)
+	}
+	return systemDB, nil
+}
+
+func newSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (SystemDatabase, error) {
 	// Dereference fields from inputs
 	databaseURL := inputs.DatabaseURL
 	databaseSchema := inputs.DatabaseSchema
@@ -1360,15 +1389,26 @@ func (s *SysDB) StreamWakeChannel(ctx context.Context, workflowID, key string) (
 
 func (s *SysDB) Launch(ctx context.Context) {
 	done := make(chan struct{})
-	var notifierDone chan struct{}
-	if s.pushesNotifications() {
+	var notifierDone, subscriberDone chan struct{}
+	if s.pushesNotifications() || s.notifier != nil {
 		notifierDone = make(chan struct{})
+	}
+	if s.notifier != nil {
+		subscriberDone = make(chan struct{})
 	}
 	s.notificationLoopMu.Lock()
 	s.notificationLoopDone = done
 	s.notifierDone = notifierDone
+	s.subscriberDone = subscriberDone
 	s.launched = true
 	s.notificationLoopMu.Unlock()
+
+	if subscriberDone != nil {
+		go func() {
+			s.notifierSubscribeLoop(ctx)
+			close(subscriberDone)
+		}()
+	}
 
 	if notifierDone != nil {
 		go func() {
@@ -1398,6 +1438,7 @@ func (s *SysDB) Shutdown(ctx context.Context, timeout time.Duration) []string {
 	launched := s.launched
 	done := s.notificationLoopDone
 	notifierDone := s.notifierDone
+	subscriberDone := s.subscriberDone
 	s.notificationLoopMu.Unlock()
 	loopsStopped := true
 	if launched {
@@ -1418,6 +1459,15 @@ func (s *SysDB) Shutdown(ctx context.Context, timeout time.Duration) []string {
 			case <-time.After(timeout):
 				s.logger.Warn("Notifier loop did not finish in time", "timeout", timeout)
 				pending = append(pending, "notifier")
+				loopsStopped = false
+			}
+		}
+		if subscriberDone != nil {
+			select {
+			case <-subscriberDone:
+			case <-time.After(timeout):
+				s.logger.Warn("Notifier subscribe loop did not finish in time", "timeout", timeout)
+				pending = append(pending, "notifier subscriber")
 				loopsStopped = false
 			}
 		}
@@ -5017,7 +5067,11 @@ func (s *SysDB) notificationPollerLoop(ctx context.Context) {
 
 	s.logger.Debug("DBOS: Starting notification poller loop")
 
-	ticker := time.NewTicker(1 * time.Second)
+	interval := s.notificationPollInterval
+	if interval <= 0 {
+		interval = _NOTIFICATION_POLL_INTERVAL
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {

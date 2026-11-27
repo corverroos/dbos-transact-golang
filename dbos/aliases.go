@@ -14,6 +14,37 @@ import (
 // is ever needed.
 
 type (
+	// Notifier is an optional, user-supplied wake-up channel next to the
+	// system database (Config.Notifier, ClientConfig.Notifier). It lets a
+	// wait in one process wake as soon as another process commits what it
+	// waits for, instead of on its polling interval:
+	//   - a queue worker, when a workflow is enqueued on its queue or a
+	//     queued workflow finishes and frees concurrency;
+	//   - Recv, when a message is sent to it (useful where DBOS holds no
+	//     LISTEN connection: a pooler such as PgBouncer, CockroachDB, SQLite).
+	//
+	// The system database stays the source of truth. Topics are hints: a
+	// dropped, delayed or duplicated topic leaves the wait to complete on
+	// its polling interval, as without a Notifier.
+	//
+	//	type Notifier interface {
+	//		// Notify broadcasts that topics changed. DBOS calls it from a
+	//		// background loop after the writes commit, with topics coalesced
+	//		// over NotificationCoalesceInterval. An error is logged and the
+	//		// topics dropped.
+	//		Notify(ctx context.Context, topics []string) error
+	//		// Subscribe streams every topic notified by any process, this one
+	//		// included, until ctx is done. Closing the channel means topics may
+	//		// have been lost: DBOS wakes every waiter to re-check and calls
+	//		// Subscribe again. An error is retried with backoff.
+	//		Subscribe(ctx context.Context) (<-chan string, error)
+	//	}
+	//
+	// Implementations broadcast opaque topic strings between every process
+	// sharing the system database, e.g. over one Postgres LISTEN/NOTIFY
+	// channel, one Redis pub/sub channel, or Go channels within a process.
+	Notifier = sysdb.Notifier
+
 	// WorkflowStatus is a snapshot of a workflow execution: identity, current
 	// state, timing, input/output, and queue placement. Returned by
 	// ListWorkflows and by WorkflowHandle.GetStatus.

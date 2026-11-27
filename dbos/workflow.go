@@ -1657,6 +1657,9 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 			if err := tx.Commit(uncancellableCtx); err != nil {
 				return models.NewWorkflowExecutionError(workflowID, fmt.Errorf("failed to commit transaction: %w", err))
 			}
+			if len(queueName) > 0 {
+				c.systemDB.SignalQueue(queueName)
+			}
 			earlyReturnPollingHandle = newWorkflowPollingHandle[any](uncancellableCtx, workflowStatus.ID, shardKey)
 			return nil
 		}
@@ -1983,6 +1986,10 @@ func (c *dbosContext) executeWorkflow(fn WorkflowFunc, input any, exec workflowE
 				c.logger.Warn("Workflow outcome was not recorded: the workflow is no longer owned by this execution. Waiting for the recorded outcome", "workflow_id", workflowID)
 				awaitExistingOutcome(err)
 				return
+			}
+			if exec.queueName != "" {
+				// A finished queued workflow frees a concurrency slot.
+				c.systemDB.SignalQueue(exec.queueName)
 			}
 		}
 		outcomeChan <- workflowOutcome[any]{result: result, err: err}
@@ -2541,6 +2548,10 @@ func (c *dbosContext) Enqueue(_ Client, queueName, workflowName string, input an
 				c.logger.Error("failed to insert workflow status", "error", err, "workflow_id", workflowID)
 			}
 			return nil, err
+		}
+		if userTx == nil {
+			// A caller-owned transaction commits later; its enqueue waits for the queue's poll.
+			c.systemDB.SignalQueue(queueName)
 		}
 		return newWorkflowPollingHandle[any](uncancellableCtx, enqueuedID, shardKey), nil
 	}
@@ -3886,6 +3897,11 @@ func (c *dbosContext) sendMessages(messages []SendMessage, stepName string, opti
 		err = sysdb.Retry(c, func() error {
 			return c.systemDB.Send(uncancellableCtx, input)
 		}, sysdb.WithRetrierLogger(c.logger), sysdb.WithRetryCondition(c.systemDB.Dialect().IsRetryableTransaction))
+	}
+	// Wake receivers once committed. A caller-owned transaction commits later, so
+	// its receivers are left to their polling interval.
+	if err == nil && !options.txSet {
+		c.systemDB.SignalMessagesSent(c, rows)
 	}
 	return err
 }

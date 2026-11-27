@@ -204,6 +204,9 @@ type setupDBOSOptions struct {
 	schedulerPollingInterval time.Duration
 	databaseURL              string // share another test's database (sqlite URLs are per-*testing.T otherwise)
 	appName                  string // application name (defaults to "test-app")
+	notifier                 Notifier
+	disableListener          bool          // hold no LISTEN connection, as a client does
+	notificationPollInterval time.Duration // poller loop cadence without LISTEN (defaults to 1s)
 }
 
 /* Test database setup */
@@ -230,6 +233,9 @@ func setupDBOS(t *testing.T, opts setupDBOSOptions) Context {
 		AppName:                  appName,
 		Serializer:               opts.serializer,
 		SchedulerPollingInterval: opts.schedulerPollingInterval,
+		Notifier:                 opts.notifier,
+		disableListener:          opts.disableListener,
+		notificationPollInterval: opts.notificationPollInterval,
 	}
 
 	dbosCtx, err := NewContext(context.Background(), config)

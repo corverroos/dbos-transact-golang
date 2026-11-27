@@ -71,8 +71,16 @@ type Config struct {
 	SkipMigrations                 bool            // Verify the system database schema on launch instead of creating and migrating it
 	Sharding                       bool            // Use a sharded system database, a Transact Enterprise feature: every workflow lives under an explicit shard key (see WithShardKey)
 	SuspendMode                    bool            // Let Recv and Sleep park a waiting workflow in the system database instead of holding it in memory, a Transact Enterprise feature (default: false)
-	namelessOwner                  bool            // Act for no specific application: write unclaimed rows, matches all. Used by clients without an AppName.
-	isClient                       bool            // Client handle: runs no workflows, so enqueues leave the version unset by default.
+	// Notifier optionally wakes waiters in other processes sooner than their
+	// polling intervals: queue workers when work is enqueued or concurrency
+	// frees up, and Recv when a message is sent. Its signals are hints only;
+	// every wait keeps its polling interval as the fallback. Nil (the default)
+	// polls exactly as before.
+	Notifier                 Notifier
+	namelessOwner            bool          // Act for no specific application: write unclaimed rows, matches all. Used by clients without an AppName.
+	isClient                 bool          // Client handle: runs no workflows, so enqueues leave the version unset by default.
+	disableListener          bool          // Test knob: hold no LISTEN connection, as a client does.
+	notificationPollInterval time.Duration // Test knob: the poller loop's cadence without LISTEN (defaults to 1 second).
 }
 
 var applicationNamePattern = regexp.MustCompile(`^[a-z0-9-_]{3,256}$`)
@@ -135,8 +143,11 @@ func processConfig(inputConfig *Config) (*Config, error) {
 		NotificationCoalesceInterval:   inputConfig.NotificationCoalesceInterval,
 		Sharding:                       inputConfig.Sharding,
 		SuspendMode:                    inputConfig.SuspendMode,
+		Notifier:                       inputConfig.Notifier,
 		namelessOwner:                  inputConfig.namelessOwner,
 		isClient:                       inputConfig.isClient,
+		disableListener:                inputConfig.disableListener,
+		notificationPollInterval:       inputConfig.notificationPollInterval,
 	}
 
 	if dbosConfig.ConductorExecutorMetadata != nil {
@@ -783,7 +794,9 @@ func NewContext(ctx context.Context, inputConfig Config) (Context, error) {
 		ConnectionAppName:            config.AppName,
 		IdleTransactionTimeout:       config.SystemDBIdleTransactionTimeout,
 		NotificationCoalesceInterval: config.NotificationCoalesceInterval,
-		DisableListener:              config.isClient,
+		DisableListener:              config.isClient || config.disableListener,
+		Notifier:                     config.Notifier,
+		NotificationPollInterval:     config.notificationPollInterval,
 		Sharding:                     shardingFactory,
 		EncodeScheduledInput: func(ctx context.Context, scheduledTime time.Time, scheduleContext json.RawMessage) (*string, string, error) {
 			ser := resolveEncoder(ctx)
@@ -856,6 +869,7 @@ type ClientConfig struct {
 	SystemDBStartupTimeout         time.Duration   // Maximum time for system-database connection and schema verification (defaults to 2 minutes)
 	SystemDBIdleTransactionTimeout time.Duration   // Postgres idle_in_transaction_session_timeout for the connections the client creates (defaults to 1 minute; negative leaves the server setting)
 	Sharding                       bool            // Connect to a sharded system database, which needs go.dbos.dev/dbos-enterprise-go (see Config.Sharding)
+	Notifier                       Notifier        // Optional wake-up hints shared with the DBOS processes (see Config.Notifier): the client's enqueues and sends then wake their workers and receivers at once
 }
 
 // NewClient creates a new DBOS client with the provided configuration.
@@ -890,6 +904,7 @@ func NewClient(ctx context.Context, config ClientConfig) (Client, error) {
 		SystemDBStartupTimeout:         config.SystemDBStartupTimeout,
 		SystemDBIdleTransactionTimeout: config.SystemDBIdleTransactionTimeout,
 		Sharding:                       config.Sharding,
+		Notifier:                       config.Notifier,
 		SkipMigrations:                 true, // Clients never own the schema
 		namelessOwner:                  config.AppName == "",
 		isClient:                       true,
