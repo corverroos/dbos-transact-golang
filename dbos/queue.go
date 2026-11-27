@@ -824,6 +824,10 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 	// Current polling interval starts at the base interval and adjusts based on errors
 	currentPollingInterval := queue.basePollingInterval
 
+	// With a Notifier, work becoming ready on this queue ends the sleep early.
+	wake, releaseWake := ctx.systemDB.QueueWakeChannel(queue.Name)
+	defer releaseWake()
+
 	for {
 		// Reload database-backed queue configuration each iteration so runtime
 		// changes (concurrency, rate limits, polling cadence) take effect.
@@ -908,6 +912,13 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 		jitter := qr.jitterMin + rand.Float64()*(qr.jitterMax-qr.jitterMin) // #nosec G404 -- non-crypto jitter; acceptable
 		sleepDuration := time.Duration(float64(currentPollingInterval) * jitter)
 
+		// A queue backing off from contention sleeps out its interval: a wake would
+		// only add to the contention.
+		sleepWake := wake
+		if hasBackoffError {
+			sleepWake = nil
+		}
+
 		// Sleep with jittered interval, but allow early exit on context cancellation
 		select {
 		case <-ctx.Done():
@@ -915,6 +926,8 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 			return
 		case <-time.After(sleepDuration):
 			// Continue to next iteration
+		case <-sleepWake:
+			// Work may be ready; poll now
 		}
 	}
 }

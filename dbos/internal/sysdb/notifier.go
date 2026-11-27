@@ -251,6 +251,7 @@ func (s *SysDB) notifierLoop(ctx context.Context) {
 // flushNotifications emits one notifying transaction per channel for everything
 // queued since the last flush.
 func (s *SysDB) flushNotifications(ctx context.Context) {
+	s.flushNotifier(ctx)
 	for _, registry := range s.pushRegistries() { // streams, events, etc
 		payloads := registry.drainPending()
 		if len(payloads) == 0 {
